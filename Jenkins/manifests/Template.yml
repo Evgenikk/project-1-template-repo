@@ -1,0 +1,226 @@
+kind: Template
+apiVersion: v1
+metadata:
+  name: ${app}-deploy
+objects:
+## -------------------------
+## DeploymentConfig template
+## -------------------------
+- kind: DeploymentConfig
+  apiVersion: v1
+  metadata:
+    name: ${component}
+    labels:
+      app: ${app}
+      component: ${component}
+  spec:
+    replicas: ${{replicas_count}}
+    strategy:
+      type: Rolling
+    selector:
+      app: ${app}
+      component: ${component}
+    template:
+      metadata:
+        name: ${component}
+        labels:
+          app: ${app}
+          component: ${component}
+      spec:
+        containers:
+        # app container
+        - image:  ${docker_registry}/${component}:${version}
+          command: ['/bin/sh', '-c', 'java -Dspring.profiles.active=${PROJECT_ENV} -jar ${app}.jar  2>&1 | tee /var/log/app.log'] 
+          imagePullPolicy: Always
+          importPolicy:
+            insecure: "true"
+          resources:
+            requests:
+              cpu: ${requests_cpu}
+              memory: ${requests_memory}      
+            limits:
+              cpu: ${limits_cpu}
+              memory: ${limits_memory}
+          name: ${component}
+          env: 
+          - name: PROJECT_ENV
+            value: ${PROJECT_ENV}
+          readinessProbe: 
+            tcpSocket:
+              port: ${{service_port}}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          volumeMounts:
+          - name: varlog
+            mountPath: /var/log
+        # Filebeat container
+        - name: log-shipper
+          image: docker-registry/general/filebeat-openshift:7.7.1
+          imagePullPolicy: Always
+          imagePolicy:
+            insecure: "true"
+          command: ["filebeat"]
+          args: [
+            "-c", "/etc/filebeat.yaml",
+            "-e"
+          ]
+          env:
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          resources:
+            requests:
+              cpu: ${filebeat_requests_cpu}
+              memory: ${filebeat_requests_memory}
+            limits:
+              cpu: ${filebeat_limits_cpu}
+              memory: ${filebeat_limits_memory}
+          volumeMounts:
+          - name: varlog
+            mountPath: /var/log
+          - name: config
+            mountPath: /etc/filebeat.yaml
+            subPath: filebeat.yaml
+        # Logrotate container
+        - name: logrotate
+          image: docker-registry/general/docker-logrotate:v1.0
+          imagePullPolicy: Always
+          imagePolicy:
+            insecure: true
+          resources:
+            requests:
+              cpu: 1
+              memory: 50Mi
+            limits:
+              cpu: 1
+              memory: 100Mi
+          env:
+          - name: LOGROTATE_PATTERN
+            value: "/var/log/app.log"
+          volumeMounts:
+          - name: varlog
+            mountPath: /var/log
+        volumes:
+        - name: varlog
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: log-shipper-${component}
+## -------------------------
+## Service template
+## -------------------------
+- kind: Service
+  apiVersion: v1
+  metadata:
+    name: ${component}
+    labels:
+      app: ${app}
+      component: ${component}
+  spec:
+    type: ClusterIP
+    ports:
+    - name: tcp-${service_port}
+      port: ${{service_port}}
+      protocol: TCP
+      targetPort: ${{service_port}}
+    selector:
+      app: ${app}
+      component: ${component}
+## -------------------------
+## Route template
+## -------------------------
+- apiVersion: route.openshift.io/v1
+  kind: Route
+  metadata:
+    name: ${component}
+    labels:
+      app: ${app}
+      component: ${component}
+  spec:
+    host: ${service_domain_name}.${base_route_domain}
+    port:
+      targetPort: tcp-${service_port}
+    to:
+      kind: Service
+      name: ${component}
+## -------------------------
+## Filebeat ConfigMap
+## -------------------------
+- kind: ConfigMap
+  apiVersion: v1
+  metadata:
+    name: log-shipper-${component}
+    labels:
+      app: ${app}
+      component: ${component}
+  data:
+    filebeat.yaml: |-
+        filebeat.inputs:
+        - type: log
+          paths:
+          - /var/log/app.log
+        fields_under_root: true
+        fields:
+          app: ${app}
+          component: ${component}
+          env: ${env}
+          version: ${version}
+          pod_name: ${POD_NAME:?Need to set the POD_NAME environment variable}
+        processors:
+        - drop_fields:
+            fields: ["agent", "log", "ecs", "input", "host"]
+        output.kafka:
+          enabled: true
+          hosts: [${kafka_hosts}]
+          topic: ${kafka_topic}
+
+## -------------------------
+## Parameters
+## -------------------------
+parameters:
+  # Common parameters:
+  - name: app
+    value: team1
+  - name: component
+    value: <app_name>
+  # Filebeat sidecar config paramters
+  - name: kafka_hosts
+    value: 'elastic-mq01:9092, elastic-mq02:9092, elastic-mq03:9092'
+  - name: kafka_topic
+    value: "team1-logging-test"
+  - name: env
+    value: "dynamic-dev-env"
+  - name: filebeat_requests_cpu
+    value: "1"
+  - name: filebeat_requests_memory
+    value: 50Mi
+  - name: filebeat_limits_cpu
+    value: "2"
+  - name: filebeat_limits_memory
+    value: 100Mi
+  # Deployment patameters:
+  - name: docker_registry
+    value: docker-registry/team1/tmp
+  - name: replicas_count
+    value: '1'
+  - name: version
+    value: 'latest'
+  - name: PROJECT_ENV
+    value: os
+  - name: requests_cpu
+    value: "2" # Заменить на значения для приложения
+  - name: requests_memory
+    value: 400Mi  # Заменить на значения для приложения
+  - name: limits_cpu
+    value: "4"   # Заменить на значения для приложения
+  - name: limits_memory
+    value: 800Mi # Заменить на значения для приложения
+  # Network parameters:
+  - name: service_domain_name
+    value: <route_domain_name>
+  - name: base_route_domain
+    value: apps.openshift
+  - name: service_port
+    value: '<service_port>'
+
